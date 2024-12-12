@@ -70,6 +70,9 @@ contract UserData {
     mapping(address => VehicleInfo) private vehicleInfo;
     mapping(address => ClaimInfo) private claimInfo;
 
+    mapping(string => bool) private usedClaimIds;
+    mapping(string => mapping(string => bool)) private vehicleInsuranceClaims; // vehicle_no => insurance_type => claimed
+
     event ClaimSubmitted(string claim_no, address user);
 
     function encryptData(string memory data, bytes32 key) private pure returns (bytes32) {
@@ -103,6 +106,23 @@ contract UserData {
     function submitClaim(ClaimSubmission memory submission) public {
         bytes32 userKey = userEncryptionKeys[msg.sender];
         require(userKey != bytes32(0), "Encryption key not set");
+        
+        // Check for duplicate claim ID
+        require(!usedClaimIds[submission.claim_id], "Claim ID already exists");
+        
+        // For vehicle insurance, check duplicate vehicle claims
+        if (keccak256(abi.encodePacked(submission.insurance_type)) == keccak256(abi.encodePacked("car")) ||
+            keccak256(abi.encodePacked(submission.insurance_type)) == keccak256(abi.encodePacked("bike"))) {
+            
+            require(!vehicleInsuranceClaims[submission.vehicle_no][submission.insurance_type] || 
+                    submission.multiple_claim_allowed,
+                    "Vehicle already has an active claim for this insurance type");
+            
+            vehicleInsuranceClaims[submission.vehicle_no][submission.insurance_type] = true;
+        }
+        
+        // Mark claim ID as used
+        usedClaimIds[submission.claim_id] = true;
 
         userBasicInfo[msg.sender] = UserBasicInfo(
             submission.name,
@@ -221,5 +241,13 @@ contract UserData {
 
     function getUserEncryptionKey(address user) public view returns (bytes32) {
         return userEncryptionKeys[user];
+    }
+
+    function isClaimIdUsed(string memory claimId) public view returns (bool) {
+        return usedClaimIds[claimId];
+    }
+
+    function hasVehicleClaim(string memory vehicleNo, string memory insuranceType) public view returns (bool) {
+        return vehicleInsuranceClaims[vehicleNo][insuranceType];
     }
 }
