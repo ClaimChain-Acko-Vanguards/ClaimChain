@@ -1,180 +1,154 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.28;
 
-import "./UserData.sol";
+import "./ClaimStorage.sol";
+import "./QueryInfo.sol";
+import "./interfaces/IClaimTypes.sol";
+import {UserData, BaseClaimInfo, AutoClaimInfo, HealthClaimInfo, LifeClaimInfo} from "./UserData.sol";
 
 contract ClaimVerification {
+    ClaimStorage private claimStorage;
+    QueryInfo private queryInfoContract;
     UserData private userDataContract;
-    
-    // Track verified claims
-    mapping(string => bool) private verifiedClaims; // claim_no => verified
-    mapping(string => bool) private usedPolicyNumbers; // policy_no => used
-    mapping(string => uint256) private claimsByPolicy; // policy_no => number of claims
-    mapping(string => address) private claimOwners; // claim_no => owner
-    
-    // Verification status
-    enum VerificationStatus { Pending, Approved, Rejected }
-    
-    struct ClaimVerificationDetails {
-        VerificationStatus status;
-        uint256 verificationDate;
-        string reason;
-        address verifier;
+
+    // Simplified storage - just track claim metadata
+    struct ClaimMetadata {
+        uint256 submissionDate;
+        address claimant;
     }
-    
-    mapping(string => ClaimVerificationDetails) private claimVerificationDetails;
-    
-    // Events
-    event ClaimVerified(string claim_no, address user, VerificationStatus status);
-    event FraudulentClaimDetected(string claim_no, address user, string reason);
-    
-    // Only authorized verifiers can verify claims
-    mapping(address => bool) private authorizedVerifiers;
-    address private owner;
-    
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can perform this action");
-        _;
+
+    mapping(string => ClaimMetadata) private claimMetadata;
+    mapping(string => uint256) private claimsByPolicy;
+
+    // Array to track all claim IDs
+    string[] private allClaimIds;
+
+    constructor(address _claimStorage, address _queryInfoContract, address _userData) {
+        claimStorage = ClaimStorage(_claimStorage);
+        queryInfoContract = QueryInfo(_queryInfoContract);
+        userDataContract = UserData(_userData);
     }
-    
-    modifier onlyVerifier() {
-        require(authorizedVerifiers[msg.sender], "Only authorized verifiers can perform this action");
-        _;
-    }
-    
-    constructor(address _userDataContract) {
-        userDataContract = UserData(_userDataContract);
-        owner = msg.sender;
-        authorizedVerifiers[msg.sender] = true;
-    }
-    
-    function addVerifier(address _verifier) public onlyOwner {
-        authorizedVerifiers[_verifier] = true;
-    }
-    
-    function removeVerifier(address _verifier) public onlyOwner {
-        authorizedVerifiers[_verifier] = false;
-    }
-    
-    // Add new mappings
-    mapping(string => string[]) private userPhoneToClaims; // phone_number => claim_ids
-    mapping(string => string) private claimToPhone; // claim_id => phone_number
-    
-    function verifyClaim(
+
+    function storeClaim(
         string memory claim_id,
         string memory policy_no,
-        address userAddress,
-        VerificationStatus status,
-        string memory reason
-    ) public onlyVerifier {
-        // Get user claim data from UserData contract
-        (
-            string memory id,
-            string memory name,
-            string memory claim_id_stored,
-            string memory phone_number,
-            string memory kyc,
-            string memory government_id,
-            string memory email,
-            string memory insurance_type,
-            string memory vehicle_no,
-            ,,,
-            bool multiple_claim_allowed,
-            ,
-        ) = userDataContract.getClaimInfo(userAddress);
+        address userAddress
+    ) public {
+        // Try to get claim from each type
+        AutoClaimInfo memory autoClaim = userDataContract.getAutoClaimInfo(userAddress);
+        HealthClaimInfo memory healthClaim = userDataContract.getHealthClaimInfo(userAddress);
+        LifeClaimInfo memory lifeClaim = userDataContract.getLifeClaimInfo(userAddress);
 
-        // Check for duplicate claims based on phone number
-        string[] memory userClaims = userPhoneToClaims[phone_number];
-        
-        // For vehicle insurance claims
-        if (keccak256(abi.encodePacked(insurance_type)) == keccak256(abi.encodePacked("car")) ||
-            keccak256(abi.encodePacked(insurance_type)) == keccak256(abi.encodePacked("bike"))) {
-            
-            for (uint i = 0; i < userClaims.length; i++) {
-                // Get previous claim details
-                (,,,,,,, string memory prev_insurance_type, string memory prev_vehicle_no,,,,,,) = 
-                    userDataContract.getClaimInfo(claimOwners[userClaims[i]]);
-                
-                // Check for duplicate vehicle claims
-                if (keccak256(abi.encodePacked(prev_vehicle_no)) == keccak256(abi.encodePacked(vehicle_no)) &&
-                    keccak256(abi.encodePacked(prev_insurance_type)) == keccak256(abi.encodePacked(insurance_type))) {
-                    if (!multiple_claim_allowed) {
-                        emit FraudulentClaimDetected(claim_id, userAddress, "Duplicate vehicle claim detected");
-                        // Store verification details with Rejected status
-                        claimVerificationDetails[claim_id] = ClaimVerificationDetails({
-                            status: VerificationStatus.Rejected,
-                            verificationDate: block.timestamp,
-                            reason: "Duplicate vehicle claim detected",
-                            verifier: msg.sender
-                        });
-                        return;
-                    }
-                }
-            }
-        }
-        // For health, life, and travel insurance claims
-        else {
-            require(bytes(kyc).length > 0, "KYC details required for non-vehicle claims");
-            // Additional KYC verification logic can be added here
+        // Check which type of claim exists and use its data
+        string memory policy_type;
+        if (bytes(autoClaim.base.claim_id).length > 0) {
+            policy_type = autoClaim.base.policy_type;
+            // Update QueryInfo mappings with unencrypted strings
+            queryInfoContract.updateClaimMappings(
+                claim_id,
+                autoClaim.base.phone_number,
+                autoClaim.base.email_id,
+                autoClaim.base.aadhar_id,
+                autoClaim.vehicle_registration_no
+            );
+        } else if (bytes(healthClaim.base.claim_id).length > 0) {
+            policy_type = healthClaim.base.policy_type;
+            queryInfoContract.updateClaimMappings(
+                claim_id,
+                healthClaim.base.phone_number,
+                healthClaim.base.email_id,
+                healthClaim.base.aadhar_id,
+                "" // No vehicle registration for health claims
+            );
+        } else if (bytes(lifeClaim.base.claim_id).length > 0) {
+            policy_type = lifeClaim.base.policy_type;
+            queryInfoContract.updateClaimMappings(
+                claim_id,
+                lifeClaim.base.phone_number,
+                lifeClaim.base.email_id,
+                lifeClaim.base.aadhar_id,
+                "" // No vehicle registration for life claims
+            );
+        } else {
+            revert("No claim found for user");
         }
 
-        // Check if claim has already been verified
-        require(!verifiedClaims[claim_id], "Claim has already been verified");
-        
-        // Check for duplicate claim numbers
-        require(claimOwners[claim_id] == address(0), "Claim number already exists");
-        
-        // Get policy claim count
-        uint256 policyClaimCount = claimsByPolicy[policy_no];
-        
-        // Check for suspicious activity
-        if (policyClaimCount >= 3) {
-            emit FraudulentClaimDetected(claim_id, userAddress, "Multiple claims on same policy");
-            status = VerificationStatus.Rejected;
-        }
-        
-        // Store verification details
-        claimVerificationDetails[claim_id] = ClaimVerificationDetails({
-            status: status,
-            verificationDate: block.timestamp,
-            reason: reason,
-            verifier: msg.sender
+        // Store basic claim metadata
+        claimMetadata[claim_id] = ClaimMetadata({
+            submissionDate: block.timestamp,
+            claimant: userAddress
         });
         
-        // Update claim tracking
-        if (status == VerificationStatus.Approved) {
-            verifiedClaims[claim_id] = true;
-            claimOwners[claim_id] = userAddress;
-            claimsByPolicy[policy_no]++;
-        }
-        
-        // Update phone number to claims mapping
-        userPhoneToClaims[phone_number].push(claim_id);
-        claimToPhone[claim_id] = phone_number;
-        
-        emit ClaimVerified(claim_id, userAddress, status);
+        claimsByPolicy[policy_no]++;
+
+        // Store claim in ClaimStorage
+        claimStorage.storeClaim(claim_id, policy_type, userAddress, block.timestamp);
+
+        // Add claim ID to array
+        allClaimIds.push(claim_id);
     }
     
-    function getClaimVerificationStatus(string memory claim_id) public view returns (
-        VerificationStatus status,
-        uint256 verificationDate,
-        string memory reason,
-        address verifier
+    function getClaimMetadata(string memory claim_id) public view returns (
+        uint256 submissionDate,
+        address claimant
     ) {
-        ClaimVerificationDetails memory details = claimVerificationDetails[claim_id];
+        ClaimMetadata memory metadata = claimMetadata[claim_id];
         return (
-            details.status,
-            details.verificationDate,
-            details.reason,
-            details.verifier
+            metadata.submissionDate,
+            metadata.claimant
         );
-    }
-    
-    function isClaimVerified(string memory claim_id) public view returns (bool) {
-        return verifiedClaims[claim_id];
     }
     
     function getPolicyClaimCount(string memory policy_no) public view returns (uint256) {
         return claimsByPolicy[policy_no];
+    }
+
+    // Function to get all claims
+    function getAllClaims() public view returns (ClaimStorage.ClaimData[] memory) {
+        ClaimStorage.ClaimData[] memory allClaims = new ClaimStorage.ClaimData[](allClaimIds.length);
+        
+        for (uint i = 0; i < allClaimIds.length; i++) {
+            allClaims[i] = claimStorage.getClaim(allClaimIds[i]);
+        }
+        
+        return allClaims;
+    }
+    
+    // New function to search claims by parameters
+    function searchClaims(
+        string memory searchParam,
+        string memory searchType
+    ) public view returns (ClaimStorage.ClaimData[] memory) {
+        // If no search parameters, return all claims
+        if (bytes(searchParam).length == 0) {
+            return getAllClaims();
+        }
+        
+        // Use QueryInfo contract to search by parameters
+        QueryInfo.ClaimResponse[] memory responses = queryInfoContract.getClaims(searchParam, searchType);
+        ClaimStorage.ClaimData[] memory filteredClaims = new ClaimStorage.ClaimData[](responses.length);
+        
+        for (uint i = 0; i < responses.length; i++) {
+            filteredClaims[i] = claimStorage.getClaim(responses[i].claim_id);
+        }
+        
+        return filteredClaims;
+    }
+
+    // Add these functions
+    function setClaimStorageAddress(address _claimStorage) external {
+        require(address(claimStorage) == address(0), "ClaimStorage already set");
+        claimStorage = ClaimStorage(_claimStorage);
+    }
+
+    function setUserDataAddress(address _userData) external {
+        require(address(userDataContract) == address(0), "UserData already set");
+        userDataContract = UserData(_userData);
+    }
+
+    // Existing function
+    function setQueryInfoAddress(address _queryInfo) external {
+        require(address(queryInfoContract) == address(0), "QueryInfo already set");
+        queryInfoContract = QueryInfo(_queryInfo);
     }
 } 
